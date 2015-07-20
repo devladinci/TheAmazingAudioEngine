@@ -1207,6 +1207,19 @@ static OSStatus ioUnitRenderNotifyCallback(void *inRefCon, AudioUnitRenderAction
     [self releaseResourcesForChannel:group->channel];
 }
 
+BOOL AEAudioControllerRenderMainOutput(AEAudioController *audioController, AudioTimeStamp inTimeStamp, UInt32 inNumberFrames, AudioBufferList *ioData) {
+        channel_producer_arg_t arg = {
+                .channel = audioController->_topChannel,
+                .inTimeStamp = inTimeStamp,
+                .ioActionFlags = 0,
+                .nextFilterIndex = 0
+            };
+    
+        OSStatus result = channelAudioProducer((void*)&arg, ioData, &inNumberFrames);
+        handleCallbacksForChannel(arg.channel, &inTimeStamp, inNumberFrames, ioData);
+        return result;
+}
+
 -(NSArray *)channels {
     NSMutableArray *channels = [NSMutableArray array];
     [self gatherChannelsFromGroup:_topGroup intoArray:channels];
