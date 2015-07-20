@@ -1209,11 +1209,11 @@ static OSStatus ioUnitRenderNotifyCallback(void *inRefCon, AudioUnitRenderAction
 
 BOOL AEAudioControllerRenderMainOutput(AEAudioController *audioController, AudioTimeStamp inTimeStamp, UInt32 inNumberFrames, AudioBufferList *ioData) {
         channel_producer_arg_t arg = {
-                .channel = audioController->_topChannel,
-                .inTimeStamp = inTimeStamp,
-                .ioActionFlags = 0,
-                .nextFilterIndex = 0
-            };
+            .channel = audioController->_topChannel,
+            .timeStamp = inTimeStamp,
+            .ioActionFlags = 0,
+            .nextFilterIndex = 0
+        };
     
         OSStatus result = channelAudioProducer((void*)&arg, ioData, &inNumberFrames);
         handleCallbacksForChannel(arg.channel, &inTimeStamp, inNumberFrames, ioData);
