@@ -167,9 +167,6 @@ static void _AELimiterDequeue(__unsafe_unretained AELimiter *THIS, float** buffe
                 
                 // Continue attack up to next trigger value
                 stateDuration = min(THIS->_framesToNextTrigger, stateDuration);
-#ifdef DEBUG
-                assert(stateDuration >= 0);
-#endif
                 
                 if ( stateDuration > 0 ) {
                     // Apply ramp
@@ -221,9 +218,6 @@ static void _AELimiterDequeue(__unsafe_unretained AELimiter *THIS, float** buffe
                 }
                 
                 stateDuration = min(*ioLength-frameNumber, stateDuration);
-#ifdef DEBUG
-                assert(stateDuration >= 0);
-#endif
                 
                 // Apply gain
                 for ( int i=0; i<numberOfBuffers; i++ ) {
@@ -251,10 +245,6 @@ static void _AELimiterDequeue(__unsafe_unretained AELimiter *THIS, float** buffe
                         THIS->_state = kStateIdle;
                     }
                 }
-                
-#ifdef DEBUG
-                assert(stateDuration >= 0);
-#endif
                 
                 if ( stateDuration > 0 ) {
                     // Apply ramp
@@ -374,7 +364,7 @@ static element_t findMaxValueInRange(__unsafe_unretained AELimiter *THIS, AudioB
                 int length = (buffer->mBuffers[i].mDataByteSize / sizeof(float)) - bufferOffset;
                 length = MIN(length, ((int)(range.location+range.length) - framesSeen));
                 
-                vDSP_Length buffer_max_index;
+                vDSP_Length buffer_max_index = 0;
                 float buffer_max = max;
                 for ( int i=0; i<buffer->mNumberBuffers; i++ ) {
                     vDSP_maxmgvi(position, 1, &buffer_max, &buffer_max_index, length);

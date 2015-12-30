@@ -32,15 +32,6 @@
 #import <Accelerate/Accelerate.h>
 #import <pthread.h>
 
-#define checkResult(result,operation) (_checkResult((result),(operation),strrchr(__FILE__, '/')+1,__LINE__))
-static inline BOOL _checkResult(OSStatus result, const char *operation, const char* file, int line) {
-    if ( result != noErr ) {
-        NSLog(@"%s:%d: %s result %d %08X %4.4s\n", file, line, operation, (int)result, (int)result, (char*)&result); 
-        return NO;
-    }
-    return YES;
-}
-
 #ifdef DEBUG
 #define dprintf(THIS, n, __FORMAT__, ...) {if ( THIS->_debugLevel >= (n) ) { printf("<AEMixerBuffer %p>: "__FORMAT__ "\n", THIS, ##__VA_ARGS__); }}
 #else
@@ -93,6 +84,7 @@ static const UInt32 kMaxMicrofadeDuration                   = 512;
     AUGraph                     _graph;
     AUNode                      _mixerNode;
     AudioUnit                   _mixerUnit;
+    pthread_mutex_t             _graphMutex;
     AudioConverterRef           _audioConverter;
     TPCircularBuffer            _audioConverterBuffer;
     BOOL                        _audioConverterHasBuffer;
@@ -139,21 +131,25 @@ static void prepareSkipFadeBufferForSource(AEMixerBuffer *THIS, source_t* source
                                                                 selector:@selector(pollActionBuffer) 
                                                                 userInfo:nil
                                                                  repeats:YES];
+    
+    pthread_mutex_init(&_graphMutex, NULL);
         
     return self;
 }
 
 - (void)dealloc {
+    pthread_mutex_destroy(&_graphMutex);
+    
     [_mainThreadActionPollTimer invalidate];
     TPCircularBufferCleanup(&_mainThreadActionBuffer);
     
     if ( _graph ) {
-        checkResult(AUGraphClose(_graph), "AUGraphClose");
-        checkResult(DisposeAUGraph(_graph), "AUGraphClose");
+        AECheckOSStatus(AUGraphClose(_graph), "AUGraphClose");
+        AECheckOSStatus(DisposeAUGraph(_graph), "AUGraphClose");
     }
     
     if ( _audioConverter ) {
-        checkResult(AudioConverterDispose(_audioConverter), "AudioConverterDispose");
+        AECheckOSStatus(AudioConverterDispose(_audioConverter), "AudioConverterDispose");
         _audioConverter = NULL;
         TPCircularBufferCleanup(&_audioConverterBuffer);
     }
@@ -213,7 +209,7 @@ static void prepareSkipFadeBufferForSource(AEMixerBuffer *THIS, source_t* source
     }
     
     if ( _audioConverter ) {
-        checkResult(AudioConverterDispose(_audioConverter), "AudioConverterDispose");
+        AECheckOSStatus(AudioConverterDispose(_audioConverter), "AudioConverterDispose");
         _audioConverter = NULL;
         _audioConverterHasBuffer = NO;
         TPCircularBufferCleanup(&_audioConverterBuffer);
@@ -223,25 +219,34 @@ static void prepareSkipFadeBufferForSource(AEMixerBuffer *THIS, source_t* source
         // Try to set mixer's output stream format to our client format
         OSStatus result = AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_clientFormat, sizeof(_clientFormat));
         
-        if ( result == kAudioUnitErr_FormatNotSupported ) {
+        if ( result == kAudioUnitErr_PropertyNotWritable ) {
+            pthread_mutex_lock(&_graphMutex);
+            // Need to recreate the mixer. Dispose it here, it'll be recreated when we refresh below
+            AECheckOSStatus(AUGraphClose(_graph), "AUGraphClose");
+            AECheckOSStatus(DisposeAUGraph(_graph), "AUGraphClose");
+            _graph = NULL;
+            _graphReady = NO;
+            pthread_mutex_unlock(&_graphMutex);
+            
+        } else if ( result == kAudioUnitErr_FormatNotSupported ) {
             // The mixer only supports a subset of formats. If it doesn't support this one, then we'll convert manually
             
             // Get the existing format, and apply just the sample rate
             UInt32 size = sizeof(_mixerOutputFormat);
-            checkResult(AudioUnitGetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, &size),
+            AECheckOSStatus(AudioUnitGetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, &size),
                         "AudioUnitGetProperty(kAudioUnitProperty_StreamFormat)");
             _mixerOutputFormat.mSampleRate = _clientFormat.mSampleRate;
             
-            checkResult(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, sizeof(_mixerOutputFormat)),
+            AECheckOSStatus(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, sizeof(_mixerOutputFormat)),
                         "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat");
             
             
             
             // Create the audio converter
-            checkResult(AudioConverterNew(&_mixerOutputFormat, &_clientFormat, &_audioConverter), "AudioConverterNew");
+            AECheckOSStatus(AudioConverterNew(&_mixerOutputFormat, &_clientFormat, &_audioConverter), "AudioConverterNew");
             TPCircularBufferInit(&_audioConverterBuffer, kConversionBufferLength);
         } else {
-            checkResult(result, "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)");
+            AECheckOSStatus(result, "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)");
         }
     }
     
@@ -321,6 +326,11 @@ void AEMixerBufferDequeue(__unsafe_unretained AEMixerBuffer *THIS, AudioBufferLi
         return;
     }
     
+    if ( pthread_mutex_trylock(&THIS->_graphMutex) != 0 ) {
+        *ioLengthInFrames = 0;
+        return;
+    }
+    
     // If buffer list is provided with NULL mData pointers, use our own scratch buffer
     if ( bufferList && !bufferList->mBuffers[0].mData ) {
         *ioLengthInFrames = MIN(*ioLengthInFrames, kScratchBufferBytesPerChannel / (THIS->_clientFormat.mBitsPerChannel/8));
@@ -359,6 +369,8 @@ void AEMixerBufferDequeue(__unsafe_unretained AEMixerBuffer *THIS, AudioBufferLi
         for ( int i=0; i<kMaxSources; i++ ) {
             if ( THIS->_table[i].source ) THIS->_table[i].consumedFramesInCurrentTimeSlice = 0;
         }
+        
+        pthread_mutex_unlock(&THIS->_graphMutex);
         return;
     }
     
@@ -389,14 +401,13 @@ void AEMixerBufferDequeue(__unsafe_unretained AEMixerBuffer *THIS, AudioBufferLi
         for ( int i=0; i<kMaxSources; i++ ) {
             if ( THIS->_table[i].source ) THIS->_table[i].consumedFramesInCurrentTimeSlice = 0;
         }
+        pthread_mutex_unlock(&THIS->_graphMutex);
         return;
     }
     
     // We'll advance the buffer list pointers as we add audio - save the original buffer list to restore later
-    char savedBufferListSpace[sizeof(AudioBufferList)+(bufferList->mNumberBuffers-1)*sizeof(AudioBuffer)];
-    AudioBufferList *savedBufferList = (AudioBufferList*)savedBufferListSpace;
-    memcpy(savedBufferList, bufferList, sizeof(savedBufferListSpace));
-
+    AEAudioBufferListCopyOnStack(savedBufferList, bufferList, 0);
+    
     THIS->_automaticSingleSourceDequeueing = YES;
     int framesToGo = MIN(*ioLengthInFrames, bufferList->mBuffers[0].mDataByteSize / THIS->_clientFormat.mBytesPerFrame);
     
@@ -431,7 +442,7 @@ void AEMixerBufferDequeue(__unsafe_unretained AEMixerBuffer *THIS, AudioBufferLi
         renderTimestamp.mSampleTime = THIS->_sampleTime;
         renderTimestamp.mFlags = kAudioTimeStampSampleTimeValid;
         OSStatus result = AudioUnitRender(THIS->_mixerUnit, &flags, &renderTimestamp, 0, frames, intermediateBufferList);
-        if ( !checkResult(result, "AudioUnitRender") ) {
+        if ( !AECheckOSStatus(result, "AudioUnitRender") ) {
             break;
         }
         
@@ -448,7 +459,7 @@ void AEMixerBufferDequeue(__unsafe_unretained AEMixerBuffer *THIS, AudioBufferLi
                                                               &frames, 
                                                               bufferList, 
                                                               NULL);
-            if ( !checkResult(result, "AudioConverterConvertComplexBuffer") ) {
+            if ( !AECheckOSStatus(result, "AudioConverterConvertComplexBuffer") ) {
                 break;
             }
         }
@@ -474,7 +485,9 @@ void AEMixerBufferDequeue(__unsafe_unretained AEMixerBuffer *THIS, AudioBufferLi
     }
     
     // Restore buffers
-    memcpy(bufferList, savedBufferList, sizeof(savedBufferListSpace));
+    memcpy(bufferList, savedBufferList, AEAudioBufferListGetStructSize(bufferList));
+    
+    pthread_mutex_unlock(&THIS->_graphMutex);
 }
 
 
@@ -1025,7 +1038,7 @@ void AEMixerBufferMarkSourceIdle(__unsafe_unretained AEMixerBuffer *THIS, AEMixe
     }
     
     // Set input stream format
-    checkResult(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, index, &source->audioDescription, sizeof(source->audioDescription)),
+    AECheckOSStatus(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, index, &source->audioDescription, sizeof(source->audioDescription)),
                 "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)");
     
     [self respondToChannelCountChange];
@@ -1044,7 +1057,7 @@ void AEMixerBufferMarkSourceIdle(__unsafe_unretained AEMixerBuffer *THIS, AEMixe
     
     // Set volume
     AudioUnitParameterValue value = source->volume;
-    checkResult(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Input, index, value, 0),
+    AECheckOSStatus(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Input, index, value, 0),
                 "AudioUnitSetParameter(kMultiChannelMixerParam_Volume)");
 
 }
@@ -1068,7 +1081,7 @@ void AEMixerBufferMarkSourceIdle(__unsafe_unretained AEMixerBuffer *THIS, AEMixe
     
     // Set pan
     AudioUnitParameterValue value = source->pan;
-    checkResult(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Pan, kAudioUnitScope_Input, index, value, 0),
+    AECheckOSStatus(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Pan, kAudioUnitScope_Input, index, value, 0),
                 "AudioUnitSetParameter(kMultiChannelMixerParam_Pan)");
 }
 
@@ -1139,25 +1152,30 @@ static OSStatus sourceInputCallback(void *inRefCon, AudioUnitRenderActionFlags *
         if ( _table[i].source ) busCount++;
     }
     
-    if ( !checkResult(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &busCount, sizeof(busCount)),
+    if ( !AECheckOSStatus(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_ElementCount, kAudioUnitScope_Input, 0, &busCount, sizeof(busCount)),
                       "AudioUnitSetProperty(kAudioUnitProperty_ElementCount)") ) return;
+    
+    // The default volume for the MultiChannelMixer is 0 on OSX and 1 on iOS. ¯\_(ツ)_/¯
+    AudioUnitParameterValue defaultOutputVolume = 1.0;
+    if ( !AECheckOSStatus(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Output, 0, defaultOutputVolume, 0),
+                      "AudioUnitSetParameter(kMultiChannelMixerParam_Volume)") ) return;
     
     // Configure each bus
     for ( int busNumber=0; busNumber<busCount; busNumber++ ) {
         source_t *source = &_table[busNumber];
         
         // Set input stream format
-        checkResult(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, busNumber, source->audioDescription.mSampleRate ? &source->audioDescription : &_clientFormat, sizeof(AudioStreamBasicDescription)),
+        AECheckOSStatus(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, busNumber, source->audioDescription.mSampleRate ? &source->audioDescription : &_clientFormat, sizeof(AudioStreamBasicDescription)),
                     "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)");
         
         // Set volume
         AudioUnitParameterValue value = source->volume;
-        checkResult(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Input, busNumber, value, 0),
+        AECheckOSStatus(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Volume, kAudioUnitScope_Input, busNumber, value, 0),
                     "AudioUnitSetParameter(kMultiChannelMixerParam_Volume)");
         
         // Set pan
         value = source->pan;
-        checkResult(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Pan, kAudioUnitScope_Input, busNumber, value, 0),
+        AECheckOSStatus(AudioUnitSetParameter(_mixerUnit, kMultiChannelMixerParam_Pan, kAudioUnitScope_Input, busNumber, value, 0),
                     "AudioUnitSetParameter(kMultiChannelMixerParam_Pan)");
         
         // Set the render callback
@@ -1166,19 +1184,19 @@ static OSStatus sourceInputCallback(void *inRefCon, AudioUnitRenderActionFlags *
         rcbs.inputProcRefCon = (__bridge void *)self;
         OSStatus result = AUGraphSetNodeInputCallback(_graph, _mixerNode, busNumber, &rcbs);
         if ( result != kAUGraphErr_InvalidConnection /* Ignore this error */ )
-            checkResult(result, "AUGraphSetNodeInputCallback");
+            AECheckOSStatus(result, "AUGraphSetNodeInputCallback");
     }
     
     Boolean isInited = false;
     AUGraphIsInitialized(_graph, &isInited);
     if ( !isInited ) {
-        checkResult(AUGraphInitialize(_graph), "AUGraphInitialize");
+        AECheckOSStatus(AUGraphInitialize(_graph), "AUGraphInitialize");
         
         OSMemoryBarrier();
         _graphReady = YES;
     } else {
         for ( int retries=3; retries > 0; retries-- ) {
-            if ( checkResult(AUGraphUpdate(_graph, NULL), "AUGraphUpdate") ) {
+            if ( AECheckOSStatus(AUGraphUpdate(_graph, NULL), "AUGraphUpdate") ) {
                 break;
             }
             [NSThread sleepForTimeInterval:0.01];
@@ -1189,7 +1207,7 @@ static OSStatus sourceInputCallback(void *inRefCon, AudioUnitRenderActionFlags *
 - (void)createMixingGraph {
     // Create a new AUGraph
 	OSStatus result = NewAUGraph(&_graph);
-    if ( !checkResult(result, "NewAUGraph") ) return;
+    if ( !AECheckOSStatus(result, "NewAUGraph") ) return;
     
     // Multichannel mixer unit
     AudioComponentDescription mixer_desc = {
@@ -1202,19 +1220,19 @@ static OSStatus sourceInputCallback(void *inRefCon, AudioUnitRenderActionFlags *
     
     // Add mixer node to graph
     result = AUGraphAddNode(_graph, &mixer_desc, &_mixerNode );
-    if ( !checkResult(result, "AUGraphAddNode mixer") ) return;
+    if ( !AECheckOSStatus(result, "AUGraphAddNode mixer") ) return;
     
     // Open the graph - AudioUnits are open but not initialized (no resource allocation occurs here)
 	result = AUGraphOpen(_graph);
-	if ( !checkResult(result, "AUGraphOpen") ) return;
+	if ( !AECheckOSStatus(result, "AUGraphOpen") ) return;
     
     // Get reference to the audio unit
     result = AUGraphNodeInfo(_graph, _mixerNode, NULL, &_mixerUnit);
-    if ( !checkResult(result, "AUGraphNodeInfo") ) return;
+    if ( !AECheckOSStatus(result, "AUGraphNodeInfo") ) return;
     
     // Set the audio unit to handle up to 4096 frames per slice to keep rendering during screen lock
     UInt32 maxFPS = 4096;
-    checkResult(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFPS, sizeof(maxFPS)),
+    AECheckOSStatus(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &maxFPS, sizeof(maxFPS)),
                 "AudioUnitSetProperty(kAudioUnitProperty_MaximumFramesPerSlice)");
     
     // Try to set mixer's output stream format to our client format
@@ -1225,18 +1243,18 @@ static OSStatus sourceInputCallback(void *inRefCon, AudioUnitRenderActionFlags *
         
         // Get the existing format, and apply just the sample rate
         UInt32 size = sizeof(_mixerOutputFormat);
-        checkResult(AudioUnitGetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, &size),
+        AECheckOSStatus(AudioUnitGetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, &size),
                     "AudioUnitGetProperty(kAudioUnitProperty_StreamFormat)");
         _mixerOutputFormat.mSampleRate = _clientFormat.mSampleRate;
         
-        checkResult(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, sizeof(_mixerOutputFormat)), 
+        AECheckOSStatus(AudioUnitSetProperty(_mixerUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &_mixerOutputFormat, sizeof(_mixerOutputFormat)), 
                     "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat");
 
         // Create the audio converter
-        checkResult(AudioConverterNew(&_mixerOutputFormat, &_clientFormat, &_audioConverter), "AudioConverterNew");
+        AECheckOSStatus(AudioConverterNew(&_mixerOutputFormat, &_clientFormat, &_audioConverter), "AudioConverterNew");
         TPCircularBufferInit(&_audioConverterBuffer, kConversionBufferLength);
     } else {
-        checkResult(result, "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)");
+        AECheckOSStatus(result, "AudioUnitSetProperty(kAudioUnitProperty_StreamFormat)");
     }
 }
 
